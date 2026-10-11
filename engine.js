@@ -195,6 +195,36 @@
     return { id: id, sizes: sizes };
   }
 
+
+  /* average stroke half-width of a 0/1 mask: ~R for a disc of radius R, ~t for a line t pixels wide */
+  function thickness(mask, w, h) {
+    var area = 0, per = 0, x, y, i;
+    for (y = 0; y < h; y++) for (x = 0; x < w; x++) {
+      i = y * w + x; if (!mask[i]) continue; area++;
+      if (x === 0 || y === 0 || x === w - 1 || y === h - 1 || !mask[i - 1] || !mask[i + 1] || !mask[i - w] || !mask[i + w]) per++;
+    }
+    return per ? 2 * area / per : 0;
+  }
+  /* bounding box of every labelled component */
+  function compBoxes(id, count, w, h) {
+    var minx = new Int32Array(count).fill(1e9), maxx = new Int32Array(count).fill(-1), miny = new Int32Array(count).fill(1e9), maxy = new Int32Array(count).fill(-1);
+    for (var y = 0; y < h; y++) for (var x = 0; x < w; x++) {
+      var c = id[y * w + x]; if (!c) continue;
+      if (x < minx[c]) minx[c] = x; if (x > maxx[c]) maxx[c] = x; if (y < miny[c]) miny[c] = y; if (y > maxy[c]) maxy[c] = y;
+    }
+    return { minx: minx, maxx: maxx, miny: miny, maxy: maxy };
+  }
+  /* watermark strips, caption bars and photo borders: thin pieces that run along an image edge are not the subject */
+  function bannerComponents(cc, w, h) {
+    var bx = compBoxes(cc.id, cc.sizes.length, w, h), bad = new Uint8Array(cc.sizes.length), c, m = 3;
+    for (c = 1; c < cc.sizes.length; c++) {
+      var bw = bx.maxx[c] - bx.minx[c] + 1, bh = bx.maxy[c] - bx.miny[c] + 1;
+      var top = bx.miny[c] <= m, bottom = bx.maxy[c] >= h - 1 - m, left = bx.minx[c] <= m, right = bx.maxx[c] >= w - 1 - m;
+      if (((top || bottom) && bw >= w * 0.5 && bh <= h * 0.14) || ((left || right) && bh >= h * 0.5 && bw <= w * 0.14)) bad[c] = 1;
+    }
+    return bad;
+  }
+
   function otsu(values, n, maxV) {                               // threshold that best splits "background-like" from "different"
     var bins = 128, hist = new Float32Array(bins), i, total = 0;
     for (i = 0; i < n; i++) { var b = Math.min(bins - 1, Math.floor(values[i] / maxV * bins)); hist[b]++; total++; }
@@ -209,6 +239,69 @@
   }
 
   function smoothstep(a, b, x) { var t = (x - a) / (b - a); t = t < 0 ? 0 : (t > 1 ? 1 : t); return t * t * (3 - 2 * t); }
+
+
+  /* PLAIN BACKDROP MODE
+     When one flat colour fills the border (white paper, a black screen, a green wall...) the cleanest answer is a
+     colour-difference matte: how far is each pixel from the backdrop colour, and which solid foreground colour does an
+     edge pixel blend towards? That keeps hair, ink strokes and other thin parts that smoothing would destroy, and gives
+     true partial transparency on soft edges. */
+  function plainAnalysis(lab, rgba, w, h, ringIdx, assign, rC, rk, perSide, rm, isBgCluster) {
+    var n = w * h, c, i, q, totals = new Float32Array(rk), best = -1, bestT = 0;
+    for (q = 0; q < rm; q++) totals[assign[q]]++;
+    for (c = 0; c < rk; c++) if (isBgCluster[c] && totals[c] > bestT) { bestT = totals[c]; best = c; }
+    if (best < 0) return null;
+    // a flat but noisy backdrop is split into several k-means clusters: merge the ones that sit close together
+    var inGroup = new Uint8Array(rk), groupShare = 0, second = 0;
+    for (c = 0; c < rk; c++) {
+      var g0 = rC[c * 3] - rC[best * 3], g1 = rC[c * 3 + 1] - rC[best * 3 + 1], g2 = rC[c * 3 + 2] - rC[best * 3 + 2];
+      if (Math.sqrt(g0 * g0 + g1 * g1 + g2 * g2) < 9) { inGroup[c] = 1; groupShare += totals[c]; }
+    }
+    for (c = 0; c < rk; c++) if (!inGroup[c] && isBgCluster[c] && totals[c] > second) second = totals[c];
+    if (groupShare / rm < 0.5 || second / rm >= 0.2) return null;
+    var sl = 0, sa = 0, sb = 0, sr = 0, sg = 0, sbl = 0, cnt = 0;
+    for (q = 0; q < rm; q++) {
+      if (!inGroup[assign[q]]) continue; i = ringIdx[q];
+      sl += lab.L[i]; sa += lab.A[i]; sb += lab.B[i]; sr += rgba[i * 4]; sg += rgba[i * 4 + 1]; sbl += rgba[i * 4 + 2]; cnt++;
+    }
+    var Cl = sl / cnt, Ca = sa / cnt, Cb = sb / cnt, ds = [];
+    for (q = 0; q < rm; q++) {
+      if (!inGroup[assign[q]]) continue; i = ringIdx[q];
+      var e0 = lab.L[i] - Cl, e1 = lab.A[i] - Ca, e2 = lab.B[i] - Cb; ds.push(Math.sqrt(e0 * e0 + e1 * e1 + e2 * e2));
+    }
+    ds.sort(function (u, v) { return u - v; });
+    var p95 = ds[Math.min(ds.length - 1, Math.floor(ds.length * 0.95))];
+    if (p95 > 14) return null;
+    var R = Math.max(6, p95 * 1.6), dist = new Float32Array(n), within = 0;
+    for (i = 0; i < n; i++) { var f0 = lab.L[i] - Cl, f1 = lab.A[i] - Ca, f2 = lab.B[i] - Cb, d = Math.sqrt(f0 * f0 + f1 * f1 + f2 * f2); dist[i] = d; if (d < R) within++; }
+    if (within / n < 0.3) return null;
+    var t0 = Math.max(2.5, 1.7 * p95), x, y, far = [];
+    for (i = 0; i < n; i += 3) if (dist[i] > t0 * 2) far.push(dist[i]);
+    // if almost nothing stands clearly apart from the backdrop (low contrast), the general method is the better tool
+    if (far.length * 3 < n * 0.002) return null;
+    far.sort(function (u, v) { return u - v; });
+    var dCore = Math.min(Math.max(t0 * 3, 12), Math.max(t0 * 2.2, 0.6 * far[Math.floor(far.length / 2)]));
+    // where could the subject be?  anything clearly different from the backdrop, widened a little
+    var near = new Float32Array(n);
+    for (i = 0; i < n; i++) near[i] = dist[i] > t0 * 1.3 ? 1 : 0;
+    var wide = boxBlur(near, w, h, 2), gm = new Uint8Array(n);
+    for (i = 0; i < n; i++) gm[i] = wide[i] > 0.02 ? 1 : 0;
+    var cc = components(gm, w, h, 1), bad = bannerComponents(cc, w, h), keep = new Uint8Array(cc.sizes.length);
+    for (c = 1; c < cc.sizes.length; c++) keep[c] = (!bad[c] && cc.sizes[c] >= 6) ? 1 : 0;
+    var gate = new Float32Array(n), strong = new Uint8Array(n);
+    for (i = 0; i < n; i++) { var cid = cc.id[i]; if (cid && keep[cid]) { gate[i] = 1; strong[i] = dist[i] >= dCore ? 1 : 0; } }
+    // fill enclosed gaps only for solid subjects (people, products), never for line art such as signatures
+    var thk = thickness(strong, w, h), fill = new Float32Array(n);
+    if (thk >= 3) {
+      var inv = new Uint8Array(n); for (i = 0; i < n; i++) inv[i] = strong[i] ? 0 : 1;
+      var hc = components(inv, w, h, 1), touches = new Uint8Array(hc.sizes.length);
+      for (y = 0; y < h; y++) for (x = 0; x < w; x++) if (x === 0 || y === 0 || x === w - 1 || y === h - 1) touches[hc.id[y * w + x]] = 1;
+      var area = 0; for (i = 0; i < n; i++) area += strong[i];
+      for (i = 0; i < n; i++) { var hid = hc.id[i]; if (hid && !touches[hid] && hc.sizes[hid] < Math.max(area * 0.15, 50) && gate[i]) fill[i] = 1; }
+    }
+    gate = boxBlur(gate, w, h, 1);
+    return { C: [Cl, Ca, Cb], rgb: [sr / cnt, sg / cnt, sbl / cnt], p95: p95, R: R, t0: t0, dCore: dCore, gate: gate, fill: fill, thickness: thk };
+  }
 
   /* ---------------- the analysis step (works on the small copy) ---------------- */
   function analyse(rgba, w, h, seeds, iterations) {
@@ -241,11 +334,12 @@
     var isBgCluster = new Uint8Array(rk), anyBg = false;
     for (c0 = 0; c0 < rk; c0++) {
       var sidesPresent = 0, total0 = 0;
-      for (s0 = 0; s0 < 4; s0++) { total0 += perSide[c0][s0]; if (sideN[s0] > 0 && perSide[c0][s0] / sideN[s0] >= 0.05) sidesPresent++; }
+      for (s0 = 0; s0 < 4; s0++) { total0 += perSide[c0][s0]; if (sideN[s0] > 0 && perSide[c0][s0] / sideN[s0] >= 0.15) sidesPresent++; }
       if (sidesPresent >= 3 || total0 / rm >= 0.35) { isBgCluster[c0] = 1; anyBg = true; }
     }
     for (var q1 = 0; q1 < rm; q1++) if (!anyBg || isBgCluster[assign[q1]]) bgSeed[ringIdx[q1]] = 1;
     for (i = 0; i < n; i++) { if (seeds && seeds[i] === 2) bgSeed[i] = 1; if (seeds && seeds[i] === 1) { fgSeed[i] = 1; bgSeed[i] = 0; } }
+    if (!hasFg && !hasBg) { var pl = plainAnalysis(lab, rgba, w, h, ringIdx, assign, rC, rk, perSide, rm, isBgCluster); if (pl) return { plain: pl }; }
     var sb = sampleMask(lab, bgSeed, n, 4000, rand), bgC = kmeans(sb.S, sb.m, 4, 8, rand);
 
     // 2) first guess for the subject
@@ -253,7 +347,9 @@
     {
       var inner = new Float32Array(n), cnt = 0, ix0 = Math.floor(w * 0.1), ix1 = Math.ceil(w * 0.9), iy0 = Math.floor(h * 0.1), iy1 = Math.ceil(h * 0.9);
       for (y = iy0; y < iy1; y++) for (x = ix0; x < ix1; x++) inner[cnt++] = Math.sqrt(dB[y * w + x]);
-      var thr = Math.max(10, otsu(inner, cnt, 100));
+      var ringD = [], rq; for (rq = 0; rq < n; rq += 7) if (bgSeed[rq]) ringD.push(Math.sqrt(dB[rq]));
+      ringD.sort(function (u, v) { return u - v; });
+      var noise = ringD.length ? ringD[Math.floor(ringD.length * 0.95)] : 4, thr = Math.max(9, 2.2 * noise + 4);
       for (y = 0; y < h; y++) for (x = 0; x < w; x++) { i = y * w + x; mask[i] = (!bgSeed[i] && Math.sqrt(dB[i]) > thr) ? 1 : 0; }
       var cc = components(mask, w, h, 1), bestId = 0, bestSz = 0, cx = Math.round(w / 2), cy = Math.round(h / 2);
       for (var q = 1; q < cc.sizes.length; q++) if (cc.sizes[q] > bestSz) { bestSz = cc.sizes[q]; bestId = q; }
@@ -267,12 +363,12 @@
 
     if (seeds) for (i = 0; i < n; i++) { if (seeds[i] === 1) mask[i] = 1; else if (seeds[i] === 2) mask[i] = 0; }   // the person's strokes always win
 
-    var prob = new Float32Array(n), rGuide = Math.max(2, Math.round(Math.min(w, h) / 55));
+    var thk0 = thickness(mask, w, h), prob = new Float32Array(n), rGuide = Math.max(1, Math.min(Math.round(thk0 * 0.35), Math.round(Math.min(w, h) / 55)));
     for (it = 0; it < iterations; it++) {
       // 3) learn colours from the confident interior / exterior
       var mf = new Float32Array(n), mbk = new Float32Array(n);
       for (i = 0; i < n; i++) { mf[i] = mask[i]; mbk[i] = 1 - mask[i]; }
-      var er = Math.max(1, Math.round(Math.min(w, h) / 90)), fgIn = boxBlur(mf, w, h, er), bgIn = boxBlur(mbk, w, h, er);
+      var er = Math.max(1, Math.min(Math.round(thk0 * 0.25), Math.round(Math.min(w, h) / 90))), fgIn = boxBlur(mf, w, h, er), bgIn = boxBlur(mbk, w, h, er);
       var fgM = new Uint8Array(n), bgM = new Uint8Array(n);
       for (i = 0; i < n; i++) { fgM[i] = (fgIn[i] > 0.97 || fgSeed[i]) ? 1 : 0; bgM[i] = (bgIn[i] > 0.97 || bgSeed[i]) ? 1 : 0; }
       var sf = sampleMask(lab, fgM, n, 4000, rand);
@@ -299,11 +395,13 @@
       for (i = 0; i < n; i++) { if (bgSeed[i] && bc.id[i]) borderTouch[bc.id[i]] = 1; }
       for (i = 0; i < n; i++) { var b2 = bc.id[i]; if (b2 && !borderTouch[b2] && bc.sizes[b2] < n * 0.02) mask[i] = 1; }
     }
+    var bc2 = components(mask, w, h, 1), badB = bannerComponents(bc2, w, h);
+    for (i = 0; i < n; i++) { var bid = bc2.id[i]; if (bid && badB[bid]) mask[i] = 0; }
     // final soft score: the cleaned mask, snapped to image edges
     var mf2 = new Float32Array(n); for (i = 0; i < n; i++) mf2[i] = mask[i];
     var soft = guidedFilter(gray, boxBlur(mf2, w, h, 1), w, h, Math.max(2, Math.round(rGuide * 0.8)), 0.0004);
     for (i = 0; i < n; i++) { if (fgSeed[i]) soft[i] = 1; else if (seeds && seeds[i] === 2) soft[i] = 0; }
-    return soft;
+    return { soft: soft };
   }
 
   /* ---------------- public: full pipeline ---------------- */
@@ -319,30 +417,66 @@
     var small = ws < 1 ? resizeRGBA(base, ow, oh, ww, wh) : base;
     var sw0 = options.seedsW || width, sh0 = options.seedsH || height;
     var seeds = options.seeds ? resizeU8Nearest(options.seeds, sw0, sh0, ww, wh) : null;
-    var soft = analyse(small, ww, wh, seeds, iterations);
-    // up to full size and snap to the real edge
-    var P = (ww === ow && wh === oh) ? soft : resizeF32(soft, ww, wh, ow, oh), n = ow * oh, i;
-    var gray = new Float32Array(n);
-    for (i = 0; i < n; i++) { var j = i * 4; gray[i] = (0.299 * base[j] + 0.587 * base[j + 1] + 0.114 * base[j + 2]) / 255; }
-    var rEdge = Math.max(2, Math.round(Math.max(ow, oh) / 400));
-    P = guidedFilter(gray, P, ow, oh, rEdge, 0.0002);
-    var lo = 0.5 - 0.12 - softness * 0.2, hi = 0.5 + 0.12 + softness * 0.2, alpha = new Uint8ClampedArray(n), a = new Float32Array(n);
-    for (i = 0; i < n; i++) { var s = smoothstep(lo, hi, P[i]); a[i] = s; alpha[i] = Math.round(s * 255); }
-    if (options.seeds) { var sd = resizeU8Nearest(options.seeds, sw0, sh0, ow, oh); for (i = 0; i < n; i++) { if (sd[i] === 1) { a[i] = 1; alpha[i] = 255; } else if (sd[i] === 2) { a[i] = 0; alpha[i] = 0; } } }
-    // de-fringe: take the estimated background colour out of the semi-transparent edge pixels
-    var out = new Uint8ClampedArray(n * 4), inv = new Float32Array(n), ch = [new Float32Array(n), new Float32Array(n), new Float32Array(n)];
-    for (i = 0; i < n; i++) { var w0 = 1 - a[i]; inv[i] = w0 > 0.98 ? 1 : (w0 < 0.02 ? 0 : w0); var k4 = i * 4; ch[0][i] = base[k4] * inv[i]; ch[1][i] = base[k4 + 1] * inv[i]; ch[2][i] = base[k4 + 2] * inv[i]; }
-    var rb = Math.max(3, Math.round(Math.max(ow, oh) / 200)), mInv = boxBlur(inv, ow, oh, rb), mc = [boxBlur(ch[0], ow, oh, rb), boxBlur(ch[1], ow, oh, rb), boxBlur(ch[2], ow, oh, rb)];
+    var an = analyse(small, ww, wh, seeds, iterations), n = ow * oh, i, alpha = new Uint8ClampedArray(n), a = new Float32Array(n), mode = 'general', Bconst = null, plainNear = null;
+    if (an.plain) {
+      /* colour-difference matte computed at FULL resolution, limited to the places the analysis found */
+      mode = 'plain'; var pl = an.plain, labF = toLab(base, n), gateUp = resizeF32(pl.gate, ww, wh, ow, oh), fillUp = resizeF32(pl.fill, ww, wh, ow, oh);
+      var Cl = pl.C[0], Ca = pl.C[1], Cb = pl.C[2], dF = new Float32Array(n), ring = Math.max(2, Math.round(Math.min(ow, oh) * 0.02)), samp = [], x, y;
+      for (i = 0; i < n; i++) { var e0 = labF.L[i] - Cl, e1 = labF.A[i] - Ca, e2 = labF.B[i] - Cb; dF[i] = Math.sqrt(e0 * e0 + e1 * e1 + e2 * e2); }
+      for (y = 0; y < oh; y += 2) for (x = 0; x < ow; x += 2) if (x < ring || y < ring || x >= ow - ring || y >= oh - ring) { var dv = dF[y * ow + x]; if (dv < pl.R) samp.push(dv); }
+      samp.sort(function (u, v) { return u - v; });
+      var p95f = samp.length ? samp[Math.floor(samp.length * 0.95)] : pl.p95, t0 = Math.max(pl.t0, 1.7 * p95f), dCore = Math.max(pl.dCore, t0 * 2.2);
+      // 1) solid foreground = clearly different from the backdrop and inside the analysed area
+      var NONE = -1, nearIdx = new Int32Array(n).fill(NONE), nearD = new Float32Array(n).fill(1e9);
+      for (i = 0; i < n; i++) if (dF[i] >= dCore && gateUp[i] > 0.5) { nearIdx[i] = i; nearD[i] = 0; }
+      // 2) for every other pixel find the nearest solid foreground pixel (two-pass chamfer propagation)
+      function relax(i, j, cost) { var v = nearD[j] + cost; if (v < nearD[i]) { nearD[i] = v; nearIdx[i] = nearIdx[j]; } }
+      for (y = 0; y < oh; y++) for (x = 0; x < ow; x++) { i = y * ow + x; if (x > 0) relax(i, i - 1, 1); if (y > 0) { relax(i, i - ow, 1); if (x > 0) relax(i, i - ow - 1, 1.414); if (x < ow - 1) relax(i, i - ow + 1, 1.414); } }
+      for (y = oh - 1; y >= 0; y--) for (x = ow - 1; x >= 0; x--) { i = y * ow + x; if (x < ow - 1) relax(i, i + 1, 1); if (y < oh - 1) { relax(i, i + ow, 1); if (x < ow - 1) relax(i, i + ow + 1, 1.414); if (x > 0) relax(i, i + ow - 1, 1.414); } }
+      var maxR = Math.max(4, Math.max(ow, oh) * 0.004), gamma = 1.3 - 0.6 * softness;
+      // 3) alpha of an edge pixel = how far along the line (backdrop colour -> nearby solid colour) it lies
+      for (i = 0; i < n; i++) {
+        var g = gateUp[i], v;
+        if (dF[i] >= dCore && g > 0.5) v = 1;
+        else if (dF[i] <= t0 || g <= 0.02 || nearIdx[i] === NONE || nearD[i] > maxR) v = 0;
+        else {
+          var f = nearIdx[i], u0 = labF.L[f] - Cl, u1 = labF.A[f] - Ca, u2 = labF.B[f] - Cb, uu = u0 * u0 + u1 * u1 + u2 * u2;
+          var p0 = labF.L[i] - Cl, p1 = labF.A[i] - Ca, p2 = labF.B[i] - Cb;
+          v = uu > 1 ? (p0 * u0 + p1 * u1 + p2 * u2) / uu : 0; v = v < 0 ? 0 : (v > 1 ? 1 : v); v = Math.pow(v, gamma) * (g > 1 ? 1 : g);
+        }
+        if (fillUp[i] > 0.5 && v < 1) v = Math.max(v, fillUp[i] > 1 ? 1 : fillUp[i]);
+        a[i] = v;
+      }
+      Bconst = pl.rgb; plainNear = nearIdx;
+    } else {
+      var soft = an.soft, P = (ww === ow && wh === oh) ? soft : resizeF32(soft, ww, wh, ow, oh), gray = new Float32Array(n);
+      for (i = 0; i < n; i++) { var j = i * 4; gray[i] = (0.299 * base[j] + 0.587 * base[j + 1] + 0.114 * base[j + 2]) / 255; }
+      var rEdge = Math.max(2, Math.round(Math.max(ow, oh) / 400));
+      P = guidedFilter(gray, P, ow, oh, rEdge, 0.0002);
+      var lo = 0.5 - 0.12 - softness * 0.2, hi = 0.5 + 0.12 + softness * 0.2;
+      for (i = 0; i < n; i++) a[i] = smoothstep(lo, hi, P[i]);
+    }
+    if (options.seeds) { var sd = resizeU8Nearest(options.seeds, sw0, sh0, ow, oh); for (i = 0; i < n; i++) { if (sd[i] === 1) a[i] = 1; else if (sd[i] === 2) a[i] = 0; } }
+    for (i = 0; i < n; i++) alpha[i] = Math.round(a[i] * 255);
+    // de-fringe: take the backdrop colour out of semi-transparent edge pixels. Fully transparent pixels keep their
+    // ORIGINAL colour so that a later "restore" brush reveals the real photo.
+    var out = new Uint8ClampedArray(n * 4), mc = null, mInv = null;
+    if (!Bconst) {
+      var inv = new Float32Array(n), ch = [new Float32Array(n), new Float32Array(n), new Float32Array(n)];
+      for (i = 0; i < n; i++) { var w0 = 1 - a[i]; inv[i] = w0 > 0.98 ? 1 : (w0 < 0.02 ? 0 : w0); var k4 = i * 4; ch[0][i] = base[k4] * inv[i]; ch[1][i] = base[k4 + 1] * inv[i]; ch[2][i] = base[k4 + 2] * inv[i]; }
+      var rb = Math.max(3, Math.round(Math.max(ow, oh) / 200)); mInv = boxBlur(inv, ow, oh, rb); mc = [boxBlur(ch[0], ow, oh, rb), boxBlur(ch[1], ow, oh, rb), boxBlur(ch[2], ow, oh, rb)];
+    }
     for (i = 0; i < n; i++) {
       var o = i * 4, al = a[i];
-      if (al >= 0.98 || mInv[i] < 0.02) { out[o] = base[o]; out[o + 1] = base[o + 1]; out[o + 2] = base[o + 2]; }
+      if (al >= 0.98 || al < 0.02 || (mInv && mInv[i] < 0.02)) { out[o] = base[o]; out[o + 1] = base[o + 1]; out[o + 2] = base[o + 2]; }
+      else if (plainNear && plainNear[i] >= 0) { var fo = plainNear[i] * 4; out[o] = base[fo]; out[o + 1] = base[fo + 1]; out[o + 2] = base[fo + 2]; }
       else {
-        var Bk = [mc[0][i] / mInv[i], mc[1][i] / mInv[i], mc[2][i] / mInv[i]], den = Math.max(al, 0.15);
+        var Bk = Bconst || [mc[0][i] / mInv[i], mc[1][i] / mInv[i], mc[2][i] / mInv[i]], den = Math.max(al, Bconst ? 0.04 : 0.15);
         for (var c = 0; c < 3; c++) { var f = (base[o + c] - (1 - al) * Bk[c]) / den; out[o + c] = f < 0 ? 0 : (f > 255 ? 255 : f); }
       }
       out[o + 3] = alpha[i];
     }
-    return { rgba: out, alpha: alpha, width: ow, height: oh };
+    return { rgba: out, alpha: alpha, width: ow, height: oh, mode: mode };
   }
 
   var API = { run: run, _internals: { boxBlur: boxBlur, guidedFilter: guidedFilter, kmeans: kmeans, resizeRGBA: resizeRGBA } };
