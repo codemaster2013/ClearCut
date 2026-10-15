@@ -41,10 +41,17 @@
   }
   function newCanvas(w, h) { var c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
 
+  var pending = null, decoding = false;
+  function loadOrQueue(file) {                      // a photo that arrives while another is being cut out waits its turn
+    if (!file) return;
+    if (running || decoding) { pending = file; say('Finishing the current photo, then yours starts automatically…'); return; }
+    load(file);
+  }
+  function nextPending() { if (pending && !running && !decoding) { var f = pending; pending = null; load(f); } }
   function load(file) {
     if (!file) return;
-    if (running) { say('Please wait until the current photo has finished.', true); return; }
     if (!/^image\//.test(file.type || 'image/x')) { say('That file is not an image.', true); return; }
+    decoding = true;
     decode(file).then(function (im) {
       var iw = im.width || im.naturalWidth, ih = im.height || im.naturalHeight, k = Math.min(1, 2048 / Math.max(iw, ih));
       S.orig = im; S.OW = iw; S.OH = ih; S.W = Math.max(1, Math.round(iw * k)); S.H = Math.max(1, Math.round(ih * k));
@@ -53,26 +60,26 @@
       S.hist = []; S.redo = []; S.histBytes = 0; S.ready = false; S.mask = S.auto = null; S.cutC = null;
       S.bg = { type: 'none', color: '#ffffff', g: ['#8b5cf6', '#06b6d4'], img: null }; S.bgC = null; S.bgDirty = true; syncBgUI();
       drop.classList.add('hide'); editor.classList.remove('hide'); layout(); resetView(); updateButtons();
-      autoCut();
-    }).catch(function () { say('This photo could not be opened. Try a JPG, PNG or WebP.', true); });
+      decoding = false; autoCut();
+    }).catch(function () { decoding = false; say('This photo could not be opened. Try a JPG, PNG or WebP.', true); setTimeout(nextPending, 0); });
   }
 
   function autoCut() {
-    running = true; busy.classList.add('on'); say(''); var t0 = Date.now();
+    running = true; busy.classList.add('on'); if (!pending) say(''); var t0 = Date.now();
     if (!worker) { try { worker = new Worker('worker.js'); } catch (e) { running = false; busy.classList.remove('on'); say('Your browser could not start the cut-out engine.', true); return; } }
     var img = S.origC.getContext('2d').getImageData(0, 0, S.W, S.H);
     worker.onmessage = function (e) {
       running = false; busy.classList.remove('on'); var m = e.data;
-      if (!m.ok) { say('Something went wrong: ' + m.error, true); return; }
+      if (!m.ok) { say('Something went wrong: ' + m.error, true); setTimeout(nextPending, 0); return; }
       S.W = m.width; S.H = m.height;
       S.cutData = new ImageData(new Uint8ClampedArray(m.rgba), S.W, S.H);
       S.mask = new Uint8ClampedArray(S.W * S.H); S.auto = new Uint8ClampedArray(S.W * S.H);
       for (var i = 0, j = 3; i < S.mask.length; i++, j += 4) S.mask[i] = S.auto[i] = S.cutData.data[j];
       S.cutC = newCanvas(S.W, S.H); S.cutX = S.cutC.getContext('2d'); S.cutX.putImageData(S.cutData, 0, 0);
       strokeBase = new Uint8ClampedArray(S.W * S.H);
-      S.method = m.mode === 'plain' ? 'plain-backdrop colour matte' : 'colour-model segmentation';
-      S.ready = true; resetView(); updateButtons(); requestDraw();
-      say('Done in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s (' + S.method + '). Use the brush to fix anything that is not right.');
+      S.method = m.mode === 'plain' ? 'flat-backdrop colour matte' : (m.mode === 'adaptive' ? 'adaptive-backdrop colour matte' : 'colour-model segmentation');
+      S.ready = true; resetView(); updateButtons(); requestDraw(); setTimeout(nextPending, 0);
+      say(pending ? 'Done. Starting your next photo…' : 'Done in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s (' + S.method + '). Use the brush to fix anything that is not right.');
     };
     worker.onerror = function () { running = false; busy.classList.remove('on'); say('The cut-out engine stopped unexpectedly.', true); };
     worker.postMessage({ rgba: img.data.buffer, width: S.W, height: S.H, seeds: null, softness: 0.5, maxOut: Math.max(S.W, S.H) }, [img.data.buffer]);
@@ -324,11 +331,33 @@
   function pick() { fileIn.value = ''; fileIn.click(); }
   drop.addEventListener('click', pick); drop.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
   $('newPic').addEventListener('click', pick);
-  fileIn.addEventListener('change', function () { load(fileIn.files && fileIn.files[0]); });
+  fileIn.addEventListener('change', function () { loadOrQueue(fileIn.files && fileIn.files[0]); });
   ['dragenter', 'dragover'].forEach(function (t) { document.addEventListener(t, function (e) { e.preventDefault(); drop.classList.add('over'); }); });
   ['dragleave', 'drop'].forEach(function (t) { document.addEventListener(t, function (e) { e.preventDefault(); drop.classList.remove('over'); }); });
-  document.addEventListener('drop', function (e) { var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; if (f) load(f); });
-  document.addEventListener('paste', function (e) { var it = (e.clipboardData && e.clipboardData.items) || []; for (var i = 0; i < it.length; i++) if (it[i].kind === 'file' && /^image\//.test(it[i].type)) { load(it[i].getAsFile()); return; } });
+  document.addEventListener('drop', function (e) { var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; if (f) loadOrQueue(f); });
+  /* ---- paste: Ctrl+V / long-press > Paste, the Paste button (phones), and keyboards that insert pictures ---- */
+  function nameIt(blob) { try { blob.name = blob.name || 'pasted-image'; } catch (e) {} return blob; }
+  document.addEventListener('paste', function (e) {
+    var t = e.target && e.target.tagName; if (/^(INPUT|TEXTAREA|SELECT)$/.test(t || '')) return;
+    var it = (e.clipboardData && e.clipboardData.items) || [];
+    for (var i = 0; i < it.length; i++) if (it[i].kind === 'file' && /^image\//.test(it[i].type)) { e.preventDefault(); loadOrQueue(nameIt(it[i].getAsFile())); $('pasteBox').classList.add('hide'); $('pasteBox').innerHTML = ''; return; }
+  });
+  function showPasteBox(why) { var b = $('pasteBox'); b.classList.remove('hide'); b.innerHTML = ''; b.focus(); say(why || 'Touch and hold in the box below, then choose Paste.'); }
+  function pasteFromClipboard() {
+    if (!(navigator.clipboard && navigator.clipboard.read)) { showPasteBox('Your browser cannot paste with a button. Touch and hold in the box below, then choose Paste (or press Ctrl+V).'); return; }
+    navigator.clipboard.read().then(function (items) {
+      for (var i = 0; i < items.length; i++) for (var j = 0; j < items[i].types.length; j++) if (/^image\//.test(items[i].types[j])) {
+        return items[i].getType(items[i].types[j]).then(function (blob) { loadOrQueue(nameIt(blob)); });
+      }
+      say('There is no image on the clipboard. Copy or screenshot a picture first, then tap Paste.', true);
+    }).catch(function () { showPasteBox('Paste was not allowed. Touch and hold in the box below, then choose Paste.'); });
+  }
+  $('pasteBtn').addEventListener('click', function (e) { e.stopPropagation(); pasteFromClipboard(); });
+  $('pasteBtn2').addEventListener('click', pasteFromClipboard);
+  $('pasteBox').addEventListener('input', function () {          // some phone keyboards insert the picture as an <img> instead of firing a paste event
+    var im = this.querySelector('img'); if (!im) return; var box = this;
+    var tmp = new Image(); tmp.onload = function () { var c = newCanvas(tmp.naturalWidth, tmp.naturalHeight); c.getContext('2d').drawImage(tmp, 0, 0); c.toBlob(function (b) { if (b) { box.innerHTML = ''; box.classList.add('hide'); loadOrQueue(nameIt(b)); } }, 'image/png'); }; tmp.src = im.src;
+  });
   document.addEventListener('keydown', function (e) {
     var tag = (e.target && e.target.tagName) || ''; if (/INPUT|SELECT|TEXTAREA/.test(tag) && e.target.type !== 'range' && e.target.type !== 'checkbox') return;
     var mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();

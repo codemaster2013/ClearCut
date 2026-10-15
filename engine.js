@@ -23,6 +23,27 @@
 (function (root) {
   'use strict';
 
+  /* ---------------- tunable settings (measured and tuned on a benchmark, see README) ---------------- */
+  var DEFAULTS = {
+    ringFrac: 0.025,                 // width of the border ring that is assumed to be backdrop
+    thrK: 2.2, thrB: 4, thrMin: 9,   // first guess: a pixel is "different" if its distance > thrK*noise + thrB (at least thrMin)
+    bgK: 4, fgK: 5, bgK2: 5,         // number of colour clusters: first backdrop model, subject model, backdrop model
+    prior: 30,                       // softness of the subject/backdrop score
+    guideEps: 0.0006, guideDiv: 55,  // edge-aware smoothing strength and radius (image size / guideDiv)
+    seedPenalty: 0.15,               // how strongly border pixels are pushed towards "backdrop"
+    finalEps: 0.0004, edgeBase: 0.12, edgeSoft: 0.2,
+    t0K: 1.7, t0Min: 2.5, coreMin: 18, coreK: 3, coreFrac: 0.78,   // plain-backdrop matte
+    floodMin: 4.5, floodK: 3.2, floodB: 2, floodAdapt: 0.195,         // adaptive backdrop: how far a pixel may differ and still count as backdrop
+    floodGradK: 2.5, floodGradMin: 2.5,                              // adaptive backdrop: the flood stops at colour changes steeper than this
+    fillR: 0.045, adaptP95Max: 16,                                    // adaptive backdrop: spreading radius, and the largest accepted residual
+    stableK: 1.6875, stableB: 1, ridgeFrac: 0.97,                         // solid subject: colour is stable (gradient below stableK*noise+stableB) or a thin-line ridge
+    bandRho: 4, bandMin: 0.8, bandTol: 0.8,                           // seams between two backdrop tones: reach in pixels, minimum colour step, tolerance
+    fillThk: 3,                                                       // enclosed gaps are filled only for subjects at least this thick (never for thin line art)
+    adaptiveFirst: 1, flatP95Max: 7,                                                    // the flat-backdrop method is used only when the border is this uniform
+    iterations: 4
+  };
+  var CFG = DEFAULTS;
+
   /* ---------------- small helpers ---------------- */
   var LIN = new Float32Array(256);
   (function () { for (var i = 0; i < 256; i++) { var c = i / 255; LIN[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); } })();
@@ -246,7 +267,7 @@
      colour-difference matte: how far is each pixel from the backdrop colour, and which solid foreground colour does an
      edge pixel blend towards? That keeps hair, ink strokes and other thin parts that smoothing would destroy, and gives
      true partial transparency on soft edges. */
-  function plainAnalysis(lab, rgba, w, h, ringIdx, assign, rC, rk, perSide, rm, isBgCluster) {
+  function plainAnalysis(lab, rgba, w, h, ringIdx, assign, rC, rk, perSide, rm, isBgCluster, p95Max) {
     var n = w * h, c, i, q, totals = new Float32Array(rk), best = -1, bestT = 0;
     for (q = 0; q < rm; q++) totals[assign[q]]++;
     for (c = 0; c < rk; c++) if (isBgCluster[c] && totals[c] > bestT) { bestT = totals[c]; best = c; }
@@ -271,16 +292,24 @@
     }
     ds.sort(function (u, v) { return u - v; });
     var p95 = ds[Math.min(ds.length - 1, Math.floor(ds.length * 0.95))];
-    if (p95 > 14) return null;
+    if (p95 > p95Max) return null;
     var R = Math.max(6, p95 * 1.6), dist = new Float32Array(n), within = 0;
     for (i = 0; i < n; i++) { var f0 = lab.L[i] - Cl, f1 = lab.A[i] - Ca, f2 = lab.B[i] - Cb, d = Math.sqrt(f0 * f0 + f1 * f1 + f2 * f2); dist[i] = d; if (d < R) within++; }
     if (within / n < 0.3) return null;
-    var t0 = Math.max(2.5, 1.7 * p95), x, y, far = [];
+    var tail = backdropTail(dist, p95, w, h); if (!tail) return null;
+    return { kind: 'plain', C: [Cl, Ca, Cb], map: null, rgb: [sr / cnt, sg / cnt, sbl / cnt], p95: p95, R: R, t0: tail.t0, dCore: tail.dCore, gate: tail.gate, fill: tail.fill, thickness: tail.thk };
+  }
+
+  /* shared by the flat and the adaptive backdrop modes: given how far every pixel is from the backdrop colour,
+     decide where the subject can be (gate), the "solid subject" distance (dCore) and which enclosed gaps to fill */
+  function backdropTail(dist, p95, w, h) {
+    var n = w * h, i, c, x, y;
+    var t0 = Math.max(CFG.t0Min, CFG.t0K * p95), far = [];
     for (i = 0; i < n; i += 3) if (dist[i] > t0 * 2) far.push(dist[i]);
     // if almost nothing stands clearly apart from the backdrop (low contrast), the general method is the better tool
     if (far.length * 3 < n * 0.002) return null;
     far.sort(function (u, v) { return u - v; });
-    var dCore = Math.min(Math.max(t0 * 3, 12), Math.max(t0 * 2.2, 0.6 * far[Math.floor(far.length / 2)]));
+    var dCore = Math.min(Math.max(t0 * CFG.coreK, CFG.coreMin), Math.max(t0 * 2.2, CFG.coreFrac * far[Math.floor(far.length / 2)]));
     // where could the subject be?  anything clearly different from the backdrop, widened a little
     var near = new Float32Array(n);
     for (i = 0; i < n; i++) near[i] = dist[i] > t0 * 1.3 ? 1 : 0;
@@ -292,7 +321,7 @@
     for (i = 0; i < n; i++) { var cid = cc.id[i]; if (cid && keep[cid]) { gate[i] = 1; strong[i] = dist[i] >= dCore ? 1 : 0; } }
     // fill enclosed gaps only for solid subjects (people, products), never for line art such as signatures
     var thk = thickness(strong, w, h), fill = new Float32Array(n);
-    if (thk >= 3) {
+    if (thk >= CFG.fillThk) {
       var inv = new Uint8Array(n); for (i = 0; i < n; i++) inv[i] = strong[i] ? 0 : 1;
       var hc = components(inv, w, h, 1), touches = new Uint8Array(hc.sizes.length);
       for (y = 0; y < h; y++) for (x = 0; x < w; x++) if (x === 0 || y === 0 || x === w - 1 || y === h - 1) touches[hc.id[y * w + x]] = 1;
@@ -300,7 +329,89 @@
       for (i = 0; i < n; i++) { var hid = hc.id[i]; if (hid && !touches[hid] && hc.sizes[hid] < Math.max(area * 0.15, 50) && gate[i]) fill[i] = 1; }
     }
     gate = boxBlur(gate, w, h, 1);
-    return { C: [Cl, Ca, Cb], rgb: [sr / cnt, sg / cnt, sbl / cnt], p95: p95, R: R, t0: t0, dCore: dCore, gate: gate, fill: fill, thickness: thk };
+    return { t0: t0, dCore: dCore, gate: gate, fill: fill, thk: thk };
+  }
+
+  /* ADAPTIVE BACKDROP MODE
+     For gradients, vignettes, walls meeting floors and similar: flood outwards from the border while following the
+     local backdrop colour (a soft change is followed, a sudden jump such as a subject edge stops the flood). What the
+     flood reached is backdrop; its colour is then spread under the subject by normalised convolution, which gives the
+     expected backdrop colour behind every pixel. From there it is the same colour-difference matte as the flat mode,
+     so thin parts such as hair strands and ink lines survive. */
+  function adaptiveBackdrop(lab, rgba, w, h, bgSeed) {
+    var n = w * h, i, x, y, q;
+    var sL = boxBlur(lab.L, w, h, 1), sA = boxBlur(lab.A, w, h, 1), sB = boxBlur(lab.B, w, h, 1);
+    var diffs = [];
+    for (y = 0; y < h; y++) for (x = 0; x < w; x++) {
+      i = y * w + x; if (!bgSeed[i]) continue;
+      if (x + 1 < w && bgSeed[i + 1]) diffs.push(Math.hypot(sL[i] - sL[i + 1], sA[i] - sA[i + 1], sB[i] - sB[i + 1]));
+      if (y + 1 < h && bgSeed[i + w]) diffs.push(Math.hypot(sL[i] - sL[i + w], sA[i] - sA[i + w], sB[i] - sB[i + w]));
+    }
+    if (diffs.length < 50) return null;
+    diffs.sort(function (u, v) { return u - v; });
+    var tau = Math.max(CFG.floodMin, CFG.floodK * diffs[Math.floor(diffs.length * 0.9)] + CFG.floodB);
+    // edge stop: the flood may not cross places where colour changes much faster than it does anywhere on the backdrop
+    var grad = new Float32Array(n), gs = [];
+    for (y = 1; y < h - 1; y++) for (x = 1; x < w - 1; x++) {
+      i = y * w + x;
+      var gx = Math.hypot(sL[i + 1] - sL[i - 1], sA[i + 1] - sA[i - 1], sB[i + 1] - sB[i - 1]) / 2, gy = Math.hypot(sL[i + w] - sL[i - w], sA[i + w] - sA[i - w], sB[i + w] - sB[i - w]) / 2;
+      grad[i] = Math.hypot(gx, gy); if (bgSeed[i]) gs.push(grad[i]);
+    }
+    gs.sort(function (u, v) { return u - v; });
+    var gStop = Math.max(CFG.floodGradMin, CFG.floodGradK * (gs.length ? gs[Math.floor(gs.length * 0.9)] : 0));
+    var flag = new Uint8Array(n), RL = new Float32Array(n), RA = new Float32Array(n), RB = new Float32Array(n), queue = new Int32Array(n), qh = 0, qt = 0, a = CFG.floodAdapt;
+    for (i = 0; i < n; i++) if (bgSeed[i]) { flag[i] = 1; RL[i] = sL[i]; RA[i] = sA[i]; RB[i] = sB[i]; queue[qt++] = i; }
+    var nb = [0, 0, 0, 0];
+    while (qh < qt) {
+      var p = queue[qh++]; x = p % w; y = (p - x) / w;
+      nb[0] = x > 0 ? p - 1 : -1; nb[1] = x < w - 1 ? p + 1 : -1; nb[2] = y > 0 ? p - w : -1; nb[3] = y < h - 1 ? p + w : -1;
+      for (var k = 0; k < 4; k++) {
+        q = nb[k]; if (q < 0 || flag[q] || grad[q] > gStop) continue;
+        if (Math.hypot(sL[q] - RL[p], sA[q] - RA[p], sB[q] - RB[p]) < tau) { flag[q] = 1; RL[q] = RL[p] * (1 - a) + sL[q] * a; RA[q] = RA[p] * (1 - a) + sA[q] * a; RB[q] = RB[p] * (1 - a) + sB[q] * a; queue[qt++] = q; }
+      }
+    }
+    // seams: a thin strip whose colour lies BETWEEN the backdrop colours on its two sides is a backdrop transition (for example
+    // where a wall meets a floor), not part of the subject. A real thin line is a different colour, so it is kept.
+    var band = new Uint8Array(n), nBand = 0, rho = CFG.bandRho, pass, dx, dy;
+    function segHit(i, ia, ib) {
+      var ax = sL[ia], ay = sA[ia], az = sB[ia], bx = sL[ib] - ax, by = sA[ib] - ay, bz = sB[ib] - az, len2 = bx * bx + by * by + bz * bz;
+      if (Math.sqrt(len2) < CFG.bandMin * tau) return false;
+      var px = sL[i] - ax, py = sA[i] - ay, pz = sB[i] - az, t = (px * bx + py * by + pz * bz) / len2; t = t < 0 ? 0 : (t > 1 ? 1 : t);
+      return Math.hypot(px - t * bx, py - t * by, pz - t * bz) <= CFG.bandTol * tau;
+    }
+    for (pass = 0; pass < 2; pass++) {
+      for (y = 0; y < h; y++) for (x = 0; x < w; x++) {
+        i = y * w + x; if (flag[i] || band[i]) continue;
+        var a1 = -1, b1 = -1, a2 = -1, b2 = -1;
+        for (dx = 1; dx <= rho; dx++) { if (a1 < 0 && x - dx >= 0 && (flag[i - dx] || band[i - dx])) a1 = i - dx; if (b1 < 0 && x + dx < w && (flag[i + dx] || band[i + dx])) b1 = i + dx; }
+        for (dy = 1; dy <= rho; dy++) { if (a2 < 0 && y - dy >= 0 && (flag[i - dy * w] || band[i - dy * w])) a2 = i - dy * w; if (b2 < 0 && y + dy < h && (flag[i + dy * w] || band[i + dy * w])) b2 = i + dy * w; }
+        if ((a1 >= 0 && b1 >= 0 && segHit(i, a1, b1)) || (a2 >= 0 && b2 >= 0 && segHit(i, a2, b2))) { band[i] = 1; nBand++; }
+      }
+    }
+    var cov = (qt + nBand) / n; if (cov < 0.2 || cov > 0.97) return null;
+    // expected backdrop colour behind every pixel: normalised convolution over the flooded pixels, two scales
+    var M = new Float32Array(n), ML = new Float32Array(n), MA = new Float32Array(n), MB = new Float32Array(n), gl = 0, ga = 0, gb = 0;
+    for (i = 0; i < n; i++) if (flag[i]) { M[i] = 1; ML[i] = lab.L[i]; MA[i] = lab.A[i]; MB[i] = lab.B[i]; gl += lab.L[i]; ga += lab.A[i]; gb += lab.B[i]; }
+    gl /= qt; ga /= qt; gb /= qt;
+    var r1 = Math.max(3, Math.round(Math.min(w, h) * CFG.fillR)), r2 = r1 * 4;
+    var m1 = boxBlur(M, w, h, r1), l1 = boxBlur(ML, w, h, r1), a1 = boxBlur(MA, w, h, r1), b1 = boxBlur(MB, w, h, r1);
+    var m2 = boxBlur(M, w, h, r2), l2 = boxBlur(ML, w, h, r2), a2 = boxBlur(MA, w, h, r2), b2 = boxBlur(MB, w, h, r2);
+    var CL = new Float32Array(n), CA = new Float32Array(n), CB = new Float32Array(n), dist = new Float32Array(n), ds = [], sr = 0, sg = 0, sbl = 0, cnt = 0;
+    for (i = 0; i < n; i++) {
+      if (flag[i]) { CL[i] = sL[i]; CA[i] = sA[i]; CB[i] = sB[i]; }                    // visible backdrop: its own (lightly smoothed) colour
+      else if (m1[i] > 0.04) { CL[i] = l1[i] / m1[i]; CA[i] = a1[i] / m1[i]; CB[i] = b1[i] / m1[i]; }   // hidden behind the subject: estimated from its surroundings
+      else if (m2[i] > 0.002) { CL[i] = l2[i] / m2[i]; CA[i] = a2[i] / m2[i]; CB[i] = b2[i] / m2[i]; }
+      else { CL[i] = gl; CA[i] = ga; CB[i] = gb; }
+      if (band[i]) { CL[i] = lab.L[i]; CA[i] = lab.A[i]; CB[i] = lab.B[i]; }
+      dist[i] = Math.hypot(lab.L[i] - CL[i], lab.A[i] - CA[i], lab.B[i] - CB[i]);
+      if (flag[i] && (i % 3 === 0)) { ds.push(dist[i]); sr += rgba[i * 4]; sg += rgba[i * 4 + 1]; sbl += rgba[i * 4 + 2]; cnt++; }
+    }
+    ds.sort(function (u, v) { return u - v; });
+    var p95 = ds[Math.min(ds.length - 1, Math.floor(ds.length * 0.95))];
+    if (p95 > CFG.adaptP95Max) return null;
+    var tail = backdropTail(dist, p95, w, h); if (!tail) return null;
+    var bandF = new Float32Array(n); for (i = 0; i < n; i++) bandF[i] = band[i];
+    return { kind: 'adaptive', C: null, band: nBand ? bandF : null, map: { L: CL, A: CA, B: CB }, rgb: [sr / cnt, sg / cnt, sbl / cnt], p95: p95, R: Math.max(6, p95 * 1.6), t0: tail.t0, dCore: tail.dCore, gate: tail.gate, fill: tail.fill, thickness: tail.thk };
   }
 
   /* ---------------- the analysis step (works on the small copy) ---------------- */
@@ -311,7 +422,7 @@
     if (seeds) for (i = 0; i < n; i++) { if (seeds[i] === 1) hasFg = true; else if (seeds[i] === 2) hasBg = true; }
 
     // 1) background model from the border ring (plus any "erase" strokes)
-    var ring = Math.max(2, Math.round(Math.min(w, h) * 0.025)), bgSeed = new Uint8Array(n), fgSeed = new Uint8Array(n);
+    var ring = Math.max(2, Math.round(Math.min(w, h) * CFG.ringFrac)), bgSeed = new Uint8Array(n), fgSeed = new Uint8Array(n);
     // Only trust border colours that really look like a backdrop: a colour that shows up along at least three
     // sides, or fills most of the border. A subject that runs off one edge of the photo is therefore not mistaken
     // for background.
@@ -339,8 +450,9 @@
     }
     for (var q1 = 0; q1 < rm; q1++) if (!anyBg || isBgCluster[assign[q1]]) bgSeed[ringIdx[q1]] = 1;
     for (i = 0; i < n; i++) { if (seeds && seeds[i] === 2) bgSeed[i] = 1; if (seeds && seeds[i] === 1) { fgSeed[i] = 1; bgSeed[i] = 0; } }
-    if (!hasFg && !hasBg) { var pl = plainAnalysis(lab, rgba, w, h, ringIdx, assign, rC, rk, perSide, rm, isBgCluster); if (pl) return { plain: pl }; }
-    var sb = sampleMask(lab, bgSeed, n, 4000, rand), bgC = kmeans(sb.S, sb.m, 4, 8, rand);
+    if (!hasFg && !hasBg) { var flat = function (m) { return plainAnalysis(lab, rgba, w, h, ringIdx, assign, rC, rk, perSide, rm, isBgCluster, m); };
+      var pl = CFG.adaptiveFirst ? (adaptiveBackdrop(lab, rgba, w, h, bgSeed) || flat(CFG.flatP95Max) || flat(14)) : (flat(CFG.flatP95Max) || adaptiveBackdrop(lab, rgba, w, h, bgSeed) || flat(14)); if (pl) return { plain: pl }; }
+    var sb = sampleMask(lab, bgSeed, n, 4000, rand), bgC = kmeans(sb.S, sb.m, CFG.bgK, 8, rand);
 
     // 2) first guess for the subject
     var dB = minDist(lab, n, bgC), mask = new Uint8Array(n);
@@ -349,7 +461,7 @@
       for (y = iy0; y < iy1; y++) for (x = ix0; x < ix1; x++) inner[cnt++] = Math.sqrt(dB[y * w + x]);
       var ringD = [], rq; for (rq = 0; rq < n; rq += 7) if (bgSeed[rq]) ringD.push(Math.sqrt(dB[rq]));
       ringD.sort(function (u, v) { return u - v; });
-      var noise = ringD.length ? ringD[Math.floor(ringD.length * 0.95)] : 4, thr = Math.max(9, 2.2 * noise + 4);
+      var noise = ringD.length ? ringD[Math.floor(ringD.length * 0.95)] : 4, thr = Math.max(CFG.thrMin, CFG.thrK * noise + CFG.thrB);
       for (y = 0; y < h; y++) for (x = 0; x < w; x++) { i = y * w + x; mask[i] = (!bgSeed[i] && Math.sqrt(dB[i]) > thr) ? 1 : 0; }
       var cc = components(mask, w, h, 1), bestId = 0, bestSz = 0, cx = Math.round(w / 2), cy = Math.round(h / 2);
       for (var q = 1; q < cc.sizes.length; q++) if (cc.sizes[q] > bestSz) { bestSz = cc.sizes[q]; bestId = q; }
@@ -363,7 +475,7 @@
 
     if (seeds) for (i = 0; i < n; i++) { if (seeds[i] === 1) mask[i] = 1; else if (seeds[i] === 2) mask[i] = 0; }   // the person's strokes always win
 
-    var thk0 = thickness(mask, w, h), prob = new Float32Array(n), rGuide = Math.max(1, Math.min(Math.round(thk0 * 0.35), Math.round(Math.min(w, h) / 55)));
+    var thk0 = thickness(mask, w, h), prob = new Float32Array(n), rGuide = Math.max(1, Math.min(Math.round(thk0 * 0.35), Math.round(Math.min(w, h) / CFG.guideDiv)));
     for (it = 0; it < iterations; it++) {
       // 3) learn colours from the confident interior / exterior
       var mf = new Float32Array(n), mbk = new Float32Array(n);
@@ -375,15 +487,15 @@
       if (sf.m < 20) sf = sampleMask(lab, mask, n, 4000, rand);
       var sb2 = sampleMask(lab, bgM, n, 4000, rand);
       if (!sf.m || !sb2.m) break;
-      var fgC = kmeans(sf.S, sf.m, 5, 8, rand); bgC = kmeans(sb2.S, sb2.m, 5, 8, rand);
+      var fgC = kmeans(sf.S, sf.m, CFG.fgK, 8, rand); bgC = kmeans(sb2.S, sb2.m, CFG.bgK2, 8, rand);
       // 4) score each pixel
       var dF = minDist(lab, n, fgC); dB = minDist(lab, n, bgC);
       for (i = 0; i < n; i++) {
-        var pr = (dB[i] + 30) / (dB[i] + dF[i] + 60);            // 1 = looks like the subject, 0 = looks like the background
-        if (fgSeed[i]) pr = 1; else if (seeds && seeds[i] === 2) pr = 0; else if (bgSeed[i]) pr *= 0.15;
+        var pr = (dB[i] + CFG.prior) / (dB[i] + dF[i] + 2 * CFG.prior);            // 1 = looks like the subject, 0 = looks like the background
+        if (fgSeed[i]) pr = 1; else if (seeds && seeds[i] === 2) pr = 0; else if (bgSeed[i]) pr *= CFG.seedPenalty;
         prob[i] = pr;
       }
-      prob = guidedFilter(gray, prob, w, h, rGuide, 0.0006);
+      prob = guidedFilter(gray, prob, w, h, rGuide, CFG.guideEps);
       for (i = 0; i < n; i++) { if (fgSeed[i]) prob[i] = 1; else if (seeds && seeds[i] === 2) prob[i] = 0; }
       // 5) clean up: keep the main subject (+ big pieces), fill small holes
       var raw = new Uint8Array(n); for (i = 0; i < n; i++) raw[i] = prob[i] > 0.5 ? 1 : 0;
@@ -399,7 +511,7 @@
     for (i = 0; i < n; i++) { var bid = bc2.id[i]; if (bid && badB[bid]) mask[i] = 0; }
     // final soft score: the cleaned mask, snapped to image edges
     var mf2 = new Float32Array(n); for (i = 0; i < n; i++) mf2[i] = mask[i];
-    var soft = guidedFilter(gray, boxBlur(mf2, w, h, 1), w, h, Math.max(2, Math.round(rGuide * 0.8)), 0.0004);
+    var soft = guidedFilter(gray, boxBlur(mf2, w, h, 1), w, h, Math.max(2, Math.round(rGuide * 0.8)), CFG.finalEps);
     for (i = 0; i < n; i++) { if (fgSeed[i]) soft[i] = 1; else if (seeds && seeds[i] === 2) soft[i] = 0; }
     return { soft: soft };
   }
@@ -407,7 +519,8 @@
   /* ---------------- public: full pipeline ---------------- */
   function run(rgba, width, height, options) {
     options = options || {};
-    var maxWork = options.maxWork || 640, maxOut = options.maxOut || 2048, iterations = options.iterations || 4;
+    CFG = options.params ? Object.assign({}, DEFAULTS, options.params) : DEFAULTS;
+    var maxWork = options.maxWork || 640, maxOut = options.maxOut || 2048, iterations = options.iterations || CFG.iterations;
     var softness = options.softness == null ? 0.5 : options.softness;
     // output size
     var os = Math.min(1, maxOut / Math.max(width, height)), ow = Math.max(1, Math.round(width * os)), oh = Math.max(1, Math.round(height * os));
@@ -420,15 +533,33 @@
     var an = analyse(small, ww, wh, seeds, iterations), n = ow * oh, i, alpha = new Uint8ClampedArray(n), a = new Float32Array(n), mode = 'general', Bconst = null, plainNear = null;
     if (an.plain) {
       /* colour-difference matte computed at FULL resolution, limited to the places the analysis found */
-      mode = 'plain'; var pl = an.plain, labF = toLab(base, n), gateUp = resizeF32(pl.gate, ww, wh, ow, oh), fillUp = resizeF32(pl.fill, ww, wh, ow, oh);
-      var Cl = pl.C[0], Ca = pl.C[1], Cb = pl.C[2], dF = new Float32Array(n), ring = Math.max(2, Math.round(Math.min(ow, oh) * 0.02)), samp = [], x, y;
-      for (i = 0; i < n; i++) { var e0 = labF.L[i] - Cl, e1 = labF.A[i] - Ca, e2 = labF.B[i] - Cb; dF[i] = Math.sqrt(e0 * e0 + e1 * e1 + e2 * e2); }
+      mode = an.plain.kind === 'adaptive' ? 'adaptive' : 'plain'; var pl = an.plain, labF = toLab(base, n), gateUp = resizeF32(pl.gate, ww, wh, ow, oh), fillUp = resizeF32(pl.fill, ww, wh, ow, oh);
+      var Cl = pl.C ? pl.C[0] : 0, Ca = pl.C ? pl.C[1] : 0, Cb = pl.C ? pl.C[2] : 0, dF = new Float32Array(n), ring = Math.max(2, Math.round(Math.min(ow, oh) * 0.02)), samp = [], x, y;
+      var mapL = null, mapA = null, mapB = null;
+      if (pl.map) { mapL = resizeF32(pl.map.L, ww, wh, ow, oh); mapA = resizeF32(pl.map.A, ww, wh, ow, oh); mapB = resizeF32(pl.map.B, ww, wh, ow, oh); }
+      for (i = 0; i < n; i++) { var e0 = labF.L[i] - (mapL ? mapL[i] : Cl), e1 = labF.A[i] - (mapA ? mapA[i] : Ca), e2 = labF.B[i] - (mapB ? mapB[i] : Cb); dF[i] = Math.sqrt(e0 * e0 + e1 * e1 + e2 * e2); }
+      if (pl.band) { var bandUp = resizeF32(pl.band, ww, wh, ow, oh); for (i = 0; i < n; i++) if (bandUp[i] > 0.5) dF[i] = 0; }
       for (y = 0; y < oh; y += 2) for (x = 0; x < ow; x += 2) if (x < ring || y < ring || x >= ow - ring || y >= oh - ring) { var dv = dF[y * ow + x]; if (dv < pl.R) samp.push(dv); }
       samp.sort(function (u, v) { return u - v; });
       var p95f = samp.length ? samp[Math.floor(samp.length * 0.95)] : pl.p95, t0 = Math.max(pl.t0, 1.7 * p95f), dCore = Math.max(pl.dCore, t0 * 2.2);
       // 1) solid foreground = clearly different from the backdrop and inside the analysed area
       var NONE = -1, nearIdx = new Int32Array(n).fill(NONE), nearD = new Float32Array(n).fill(1e9);
-      for (i = 0; i < n; i++) if (dF[i] >= dCore && gateUp[i] > 0.5) { nearIdx[i] = i; nearD[i] = 0; }
+      // "solid subject" = clearly different from the backdrop AND either locally stable in colour or the ridge of a thin line.
+      // Blurred edge pixels are therefore NOT solid; they get a partial transparency from their nearest solid neighbour.
+      var grad = new Float32Array(n), gsamp = [], solid = new Uint8Array(n), gx, gy;
+      for (y = 1; y < oh - 1; y++) for (x = 1; x < ow - 1; x++) {
+        i = y * ow + x;
+        gx = Math.hypot(labF.L[i + 1] - labF.L[i - 1], labF.A[i + 1] - labF.A[i - 1], labF.B[i + 1] - labF.B[i - 1]) / 2; gy = Math.hypot(labF.L[i + ow] - labF.L[i - ow], labF.A[i + ow] - labF.A[i - ow], labF.B[i + ow] - labF.B[i - ow]) / 2;
+        grad[i] = Math.hypot(gx, gy); if (dF[i] < t0 && ((x + y) & 7) === 0) gsamp.push(grad[i]);
+      }
+      gsamp.sort(function (u, v) { return u - v; });
+      var gStable = CFG.stableK * (gsamp.length ? gsamp[Math.floor(gsamp.length * 0.9)] : 1) + CFG.stableB;
+      for (i = 0; i < n; i++) {
+        if (dF[i] < dCore || gateUp[i] <= 0.5) continue;
+        var ridge = false;
+        if (grad[i] >= gStable) { var xx = i % ow, yy = (i - xx) / ow; if (xx > 0 && yy > 0 && xx < ow - 1 && yy < oh - 1) { var mx = Math.max(dF[i - 1], dF[i + 1], dF[i - ow], dF[i + ow], dF[i - ow - 1], dF[i - ow + 1], dF[i + ow - 1], dF[i + ow + 1]); ridge = dF[i] >= CFG.ridgeFrac * mx; } }
+        if (grad[i] < gStable || ridge) { solid[i] = 1; nearIdx[i] = i; nearD[i] = 0; }
+      }
       // 2) for every other pixel find the nearest solid foreground pixel (two-pass chamfer propagation)
       function relax(i, j, cost) { var v = nearD[j] + cost; if (v < nearD[i]) { nearD[i] = v; nearIdx[i] = nearIdx[j]; } }
       for (y = 0; y < oh; y++) for (x = 0; x < ow; x++) { i = y * ow + x; if (x > 0) relax(i, i - 1, 1); if (y > 0) { relax(i, i - ow, 1); if (x > 0) relax(i, i - ow - 1, 1.414); if (x < ow - 1) relax(i, i - ow + 1, 1.414); } }
@@ -437,11 +568,12 @@
       // 3) alpha of an edge pixel = how far along the line (backdrop colour -> nearby solid colour) it lies
       for (i = 0; i < n; i++) {
         var g = gateUp[i], v;
-        if (dF[i] >= dCore && g > 0.5) v = 1;
+        if (solid[i]) v = 1;
         else if (dF[i] <= t0 || g <= 0.02 || nearIdx[i] === NONE || nearD[i] > maxR) v = 0;
         else {
-          var f = nearIdx[i], u0 = labF.L[f] - Cl, u1 = labF.A[f] - Ca, u2 = labF.B[f] - Cb, uu = u0 * u0 + u1 * u1 + u2 * u2;
-          var p0 = labF.L[i] - Cl, p1 = labF.A[i] - Ca, p2 = labF.B[i] - Cb;
+          var cL = mapL ? mapL[i] : Cl, cA = mapA ? mapA[i] : Ca, cB = mapB ? mapB[i] : Cb;
+          var f = nearIdx[i], u0 = labF.L[f] - cL, u1 = labF.A[f] - cA, u2 = labF.B[f] - cB, uu = u0 * u0 + u1 * u1 + u2 * u2;
+          var p0 = labF.L[i] - cL, p1 = labF.A[i] - cA, p2 = labF.B[i] - cB;
           v = uu > 1 ? (p0 * u0 + p1 * u1 + p2 * u2) / uu : 0; v = v < 0 ? 0 : (v > 1 ? 1 : v); v = Math.pow(v, gamma) * (g > 1 ? 1 : g);
         }
         if (fillUp[i] > 0.5 && v < 1) v = Math.max(v, fillUp[i] > 1 ? 1 : fillUp[i]);
@@ -453,7 +585,7 @@
       for (i = 0; i < n; i++) { var j = i * 4; gray[i] = (0.299 * base[j] + 0.587 * base[j + 1] + 0.114 * base[j + 2]) / 255; }
       var rEdge = Math.max(2, Math.round(Math.max(ow, oh) / 400));
       P = guidedFilter(gray, P, ow, oh, rEdge, 0.0002);
-      var lo = 0.5 - 0.12 - softness * 0.2, hi = 0.5 + 0.12 + softness * 0.2;
+      var lo = 0.5 - CFG.edgeBase - softness * CFG.edgeSoft, hi = 0.5 + CFG.edgeBase + softness * CFG.edgeSoft;
       for (i = 0; i < n; i++) a[i] = smoothstep(lo, hi, P[i]);
     }
     if (options.seeds) { var sd = resizeU8Nearest(options.seeds, sw0, sh0, ow, oh); for (i = 0; i < n; i++) { if (sd[i] === 1) a[i] = 1; else if (sd[i] === 2) a[i] = 0; } }
@@ -479,6 +611,6 @@
     return { rgba: out, alpha: alpha, width: ow, height: oh, mode: mode };
   }
 
-  var API = { run: run, _internals: { boxBlur: boxBlur, guidedFilter: guidedFilter, kmeans: kmeans, resizeRGBA: resizeRGBA } };
+  var API = { run: run, DEFAULTS: DEFAULTS, _internals: { boxBlur: boxBlur, guidedFilter: guidedFilter, kmeans: kmeans, resizeRGBA: resizeRGBA } };
   if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.ClearcutEngine = API;
 })(typeof self !== 'undefined' ? self : this);

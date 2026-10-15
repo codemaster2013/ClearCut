@@ -1,5 +1,5 @@
 /* Clearcut service worker: stores the site on the device so it works offline. */
-const CACHE = 'clearcut-v2';
+const CACHE = 'clearcut-v6';
 const ASSETS = ['./', './index.html', './app.js', './engine.js', './worker.js', './manifest.webmanifest', './favicon.ico', './favicon-32.png', './icon-192.png', './icon-512.png', './icon-maskable-192.png', './icon-maskable-512.png', './apple-touch-icon.png'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(CACHE).then((c) => Promise.allSettled(ASSETS.map((u) => c.add(u)))).then(() => self.skipWaiting())); });
 self.addEventListener('activate', (e) => { e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim())); });

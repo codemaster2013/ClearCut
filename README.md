@@ -25,8 +25,21 @@ Change "Clearcut" in `index.html`, `manifest.webmanifest`, `404.html` and `og-im
 - Background: transparent, solid colour, gradient or your own image.
 - Export: transparent PNG, PNG with background, or JPG; optionally at the original photo size.
 
-## How the cut-out works (no AI model, no API)
-`engine.js` is original code. For a flat backdrop it builds a colour-difference matte (each edge pixel's transparency comes from how far it lies between the backdrop colour and the nearest solid subject colour); for other backgrounds it learns backdrop and subject colours, scores every pixel, and snaps the outline to real edges. It is a classical algorithm, not a trained neural network, so busy or similar-coloured backgrounds need the brush.
+## How the cut-out works (no AI model, no API, no outside code)
+`engine.js` is original code. It works in three steps:
+1. **Backdrop first.** It floods outwards from the photo's border while following the local backdrop colour (soft gradients are followed, sudden jumps such as a subject's edge stop it), recognises seams between two backdrop tones, and estimates what the backdrop looks like behind the subject.
+2. **Colour-difference matte.** How far each pixel is from that backdrop gives the transparency. Edge pixels are measured against their nearest solid subject colour, so soft edges, hair strands and ink lines get true partial transparency. Watermark strips along an edge are dropped.
+3. **Fallback.** When no usable backdrop can be found, it learns backdrop and subject colours separately and smooths the result along real edges.
 
-## Tests
-`/tests` is not included in the site, but the engine and editor were checked with synthetic images (signature on white with a watermark strip, a multicolour subject on black, white, grey, green and blue, a textured wall, a logo, a 12 MP photo) and an automated run of the full workflow: upload, tool switching, erase, restore, undo, redo, reset, backgrounds, PNG/JPG/original-size export.
+It is a classical method, not a trained neural network. The brush in the editor is the fix for whatever it gets wrong.
+
+## What was measured
+A benchmark of 100 synthetic photos (flat, gradient, vignette, wall-and-floor, blobby and textured backdrops; people-like, product, hair-like and line-art subjects; JPEG artefacts) was used. 60 images were used to choose settings; 40 fresh ones were never used for any decision.
+
+| | Original engine | Now |
+|---|---|---|
+| Fresh images, overlap with the true shape | 0.727 | 0.855 |
+| Fresh images, average transparency error | 0.052 | 0.012 |
+| The signature-with-watermark case | 0.81 | 0.99 |
+
+Setting-tuning on only 36 images made results worse on unseen images (overfitting) and was rejected; tuning on 60 helped, and one setting was reverted after a noisy-image check. With heavy camera noise results drop (overlap about 0.79 at moderate noise, 0.73 at heavy noise). Real photographs have not been benchmarked, because none were available.

@@ -94,6 +94,9 @@ label.chk{display:flex;align-items:center;gap:8px;color:var(--txt);font-size:14p
 select{background:#0f0a22;color:var(--txt);border:1px solid var(--line);border-radius:10px;padding:9px 10px;font:inherit;max-width:100%}
 input[type=color]{width:42px;height:34px;border:1px solid var(--line);border-radius:8px;background:none;padding:2px}
 .busy{z-index:3}
+
+.pastebox{margin-top:10px;min-height:56px;border:2px dashed var(--acc);border-radius:14px;padding:14px;text-align:center;color:var(--mut);outline:none}
+.pastebox:empty:before{content:attr(data-ph)}.pastebox img{max-width:100%;border-radius:8px}
 </style>
 </head>
 <body>
@@ -101,7 +104,7 @@ input[type=color]{width:42px;height:34px;border:1px solid var(--line);border-rad
   <div class="top"><div class="brand"><img src="icon-192.png" alt="" width="34" height="34">Clearcut</div><div class="nav"><a href="#how">How it works</a><a href="#faq">FAQ</a></div></div>
   <div class="hero">
     <h1>Remove image backgrounds, privately</h1>
-    <p class="lead">Free background remover that runs in your browser. No upload, no sign-up, no watermark. Download a transparent PNG in seconds.</p>
+    <p class="lead">Free background remover that runs in your browser. Choose, drop or paste a photo and the background is removed automatically. No upload, no sign-up, no watermark.</p>
   </div>
 
   <div class="card" id="app">
@@ -109,7 +112,9 @@ input[type=color]{width:42px;height:34px;border:1px solid var(--line);border-rad
       <svg class="i" style="width:36px;height:36px" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
       <div><b>Choose a photo</b>, drop one here, or paste it</div>
       <div style="font-size:12px">JPG, PNG or WebP &middot; the background is removed automatically</div>
+      <button class="b" id="pasteBtn" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>Paste image</button>
     </div>
+    <div id="pasteBox" class="pastebox hide" contenteditable="true" role="textbox" aria-label="Paste your image here" data-ph="Touch and hold here, then choose Paste"></div>
     <input id="file" type="file" accept="image/*" class="hide">
 
     <div id="editor" class="hide">
@@ -169,7 +174,7 @@ input[type=color]{width:42px;height:34px;border:1px solid var(--line);border-rad
       </div>
 
       <div class="msg" id="msg" role="status" aria-live="polite"></div>
-      <div class="row"><button class="b" id="newPic" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>New photo</button></div>
+      <div class="row"><button class="b" id="pasteBtn2" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>Paste image</button><button class="b" id="newPic" type="button"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>New photo</button></div>
     </div>
   </div>
 
